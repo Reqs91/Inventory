@@ -601,7 +601,7 @@ function sheet({ title, message, input, options = [], cancel = 'Cancel' }) {
     root.innerHTML = `<div class="sheet-bg" data-x></div>
       <div class="sheet" role="dialog" aria-modal="true">
         ${title ? `<h3>${esc(title)}</h3>` : ''}${message ? `<p>${esc(message)}</p>` : ''}
-        ${input ? `<input id="sheetInput" autocomplete="off" autocapitalize="${input.caps || 'sentences'}" autocorrect="off" spellcheck="false" placeholder="${esc(input.placeholder || '')}" value="${esc(input.value || '')}">` : ''}
+        ${input ? `<input id="sheetInput" autocomplete="off" autocapitalize="${input.caps || 'sentences'}" autocorrect="off" spellcheck="false" ${input.mode === 'numeric' ? 'inputmode="numeric" pattern="[0-9]*"' : ''} placeholder="${esc(input.placeholder || '')}" value="${esc(input.value || '')}">` : ''}
         <div class="opts">
           ${options.map((o, i) => `<button class="btn ${o.kind || 'secondary'}" data-i="${i}">${esc(o.label)}</button>`).join('')}
           ${cancel ? `<button class="btn ghost" data-x>${esc(cancel)}</button>` : ''}
@@ -620,17 +620,23 @@ function sheet({ title, message, input, options = [], cancel = 'Cancel' }) {
       done(b.hasAttribute('data-x') ? -1 : Number(b.dataset.i));
     };
     if (inp) {
-      inp.focus();
+      inp.focus(); inp.select();
       inp.onkeydown = (e) => { if (e.key === 'Enter') done(0); };
     }
   });
 }
-const ask = async (title, message, value = '', ok = 'Save', cancel = 'Cancel', caps) => {
-  const r = await sheet({ title, message, input: { value, caps }, options: [{ label: ok, kind: 'primary' }], cancel });
+const ask = async (title, message, value = '', ok = 'Save', cancel = 'Cancel', caps, mode) => {
+  const r = await sheet({ title, message, input: { value, caps, mode }, options: [{ label: ok, kind: 'primary' }], cancel });
   return r.i === 0 ? r.value : null;
 };
 const menu = async (title, labels, dangerIdx = -1) =>
   (await sheet({ title, options: labels.map((label, i) => ({ label, kind: i === dangerIdx ? 'danger' : 'secondary' })) })).i;
+const askCount = async (title, message, value = '1', ok = 'Add') => {
+  const v = await ask(title, message, value, ok, 'Cancel', 'off', 'numeric');
+  if (v === null) return null;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 999) : null;
+};
 const confirmIt = async (title, message, ok = 'Delete') =>
   (await sheet({ title, message, options: [{ label: ok, kind: 'danger' }] })).i === 0;
 
@@ -724,8 +730,8 @@ function groupItems(job) {
   const groups = [...map].map(([key, items]) => {
     const product = job.products[key] || { name: 'Product not identified', category: 'Other' };
     const withSn = items.filter((i) => i.serial).sort((a, b) => natural(a.serial, b.serial));
-    const noSn = items.filter((i) => !i.serial);
-    return { key, product, items: [...withSn, ...noSn], count: items.length };
+    const noSn = items.length - withSn.length;
+    return { key, product, items: withSn, noSn, count: items.length };
   });
   groups.sort((a, b) =>
     (a.key === NONE) - (b.key === NONE) ||
@@ -735,6 +741,11 @@ function groupItems(job) {
 }
 
 /* ---------- product lookup ---------- */
+function upcOf(key) {
+  if (!key || !key.startsWith('gtin:')) return '';
+  const g = key.slice(5);
+  return g.startsWith('00') ? g.slice(2) : g.startsWith('0') ? g.slice(1) : g;
+}
 const productKey = (code) => { const g = toGtin14(code); return g ? 'gtin:' + g : 'code:' + code.toUpperCase(); };
 
 async function getJson(url, ms = 7000) {
@@ -839,7 +850,7 @@ function renderJob(job) {
     const cat = g.key === NONE ? 'Not identified' : g.product.category || 'Other';
     const head = cat !== prevCat ? `<div class="cat">${esc(cat)}</div>` : '';
     prevCat = cat;
-    const sub = [g.product.brand, g.product.model && 'Model ' + g.product.model].filter(Boolean).join(', ');
+    const sub = [upcOf(g.key) && 'UPC ' + upcOf(g.key), g.product.brand, g.product.model && 'Model ' + g.product.model].filter(Boolean).join(', ');
     return `${head}<section class="card">
       <button class="card-head" data-group="${esc(g.key)}">
         <div><div class="p-name">${esc(g.product.name)}</div>${sub ? `<div class="p-sub">${esc(sub)}</div>` : ''}</div>
@@ -850,6 +861,9 @@ function renderJob(job) {
         <span class="sn ${it.serial ? '' : 'none'}">${it.serial ? esc(it.serial) : 'No serial'}</span>
         ${it.lot ? `<span class="lot">Lot ${esc(it.lot)}</span>` : ''}
       </button>`).join('')}
+      ${g.noSn ? `<button class="row" data-nosn="${esc(g.key)}">
+        <span class="idx"></span><span class="sn none">No serial</span><span class="lot">Qty ${g.noSn}</span>
+      </button>` : ''}
     </section>`;
   }).join('');
 
@@ -871,6 +885,7 @@ function renderJob(job) {
   $('#pdfBtn').onclick = () => finishJob(job.id);
   app.querySelectorAll('[data-group]').forEach((b) => (b.onclick = () => groupMenu(job.id, b.dataset.group)));
   app.querySelectorAll('[data-item]').forEach((b) => (b.onclick = () => itemMenu(job.id, b.dataset.item)));
+  app.querySelectorAll('[data-nosn]').forEach((b) => (b.onclick = () => noSerialMenu(job.id, b.dataset.nosn)));
 }
 
 async function jobMenu(id) {
@@ -902,6 +917,24 @@ async function groupMenu(id, key) {
   else if (await confirmIt(del + '?', 'This removes them from the job.')) {
     updateJob(id, (j) => ({ ...j, items: j.items.filter((it) => (it.productKey || NONE) !== key) }));
   }
+  render();
+}
+
+function setNoSerialCount(id, key, n) {
+  const match = (i) => (i.productKey || NONE) === key && !i.serial;
+  updateJob(id, (j) => {
+    const keep = j.items.filter(match).slice(0, n);
+    while (keep.length < n) keep.push({ id: uid(), at: Date.now(), serial: null, lot: null, productKey: key === NONE ? null : key });
+    return { ...j, items: [...j.items.filter((i) => !match(i)), ...keep] };
+  });
+}
+
+async function noSerialMenu(id, key) {
+  const job = jobs.find((j) => j.id === id);
+  const current = job.items.filter((i) => (i.productKey || NONE) === key && !i.serial).length;
+  const p = job.products[key];
+  const n = await askCount('How many without a serial?', `${p ? p.name : 'Product not identified'}. Enter 0 to remove them.`, String(current), 'Save');
+  if (n !== null) setNoSerialCount(id, key, n);
   render();
 }
 
@@ -1010,12 +1043,15 @@ function afterUse() { if (!sc.hold) { sc.current = null; sc.step = 'product'; } 
 function activate(p) { sc.current = p; sc.step = 'serial'; say(`${p.name}: now scan its serial number`, 'info'); }
 
 async function getProduct(code) {
+  const job = scanJob();
+  const known = job && job.products[productKey(code)];
+  if (known) return known;
   busy(true);
   let p = await resolveProduct(code);
   busy(false);
   if (!p) {
     const name = await ask('New product', `No match found online for ${code}. What is it? You only need to name it once.`, '', 'Save');
-    p = name ? saveProduct(code, { name }) : { key: productKey(code), name: 'Product ' + code, brand: '', model: '', description: '', category: 'Other' };
+    p = name ? saveProduct(code, { name }) : { key: productKey(code), name: 'Unnamed product', brand: '', model: '', description: '', category: 'Other' };
   }
   return p;
 }
@@ -1072,9 +1108,19 @@ $('#scanDone').onclick = closeScanner;
 $('#holdChk').onchange = (e) => { sc.hold = e.target.checked; };
 $('#skipBtn').onclick = () => {
   if (!sc.current || sc.lock) return;
-  addItem(sc.current, null); afterUse();
-  sc.last = { data: '', t: 0 }; // allow scanning the same UPC again right away
-  scanUI();
+  run(async () => {
+    const p = sc.current;
+    const n = await askCount('How many do you have?', `${p.name} without serial numbers.`);
+    if (!n) return;
+    updateJob(sc.jobId, (j) => ({
+      ...j,
+      products: { ...j.products, [p.key]: p },
+      items: [...j.items, ...Array.from({ length: n }, () => ({ id: uid(), at: Date.now(), serial: null, lot: null, productKey: p.key }))],
+    }));
+    say(`Added ${n} × ${p.name} without serial`, 'ok');
+    afterUse();
+    sc.last = { data: '', t: 0 }; // allow scanning the same UPC again right away
+  });
 };
 $('#typeBtn').onclick = () => run(async () => {
   const forSerial = sc.step === 'serial' && sc.current;
@@ -1111,8 +1157,8 @@ function buildPdf(job) {
   doc.setFont('helvetica', 'bold'); doc.setFontSize(12.5); doc.setTextColor(...ink);
   doc.text('Summary', M, y); y += 6;
   doc.autoTable({ ...base, startY: y,
-    head: [['Product', 'Model', 'Category', 'Qty']],
-    body: groups.map((g) => [g.product.name, g.product.model || '', g.key === NONE ? '' : g.product.category || 'Other', String(g.count)]),
+    head: [['Product', 'UPC', 'Model', 'Qty']],
+    body: groups.map((g) => [g.product.name, upcOf(g.key), g.product.model || '', String(g.count)]),
     foot: [['Total', '', '', String(total)]],
     footStyles: { fontStyle: 'bold', textColor: ink, lineColor: ink, lineWidth: { top: 1.2 } },
     columnStyles: { 3: { halign: 'right', cellWidth: 40 } } });
@@ -1129,12 +1175,15 @@ function buildPdf(job) {
     }
     doc.setFont('helvetica', 'bold'); doc.setFontSize(12.5); doc.setTextColor(...ink);
     doc.text(`${g.product.name} (${g.count})`, M, y, { maxWidth: W - 2 * M });
-    const sub = [g.product.brand, g.product.model && 'Model ' + g.product.model, g.product.description].filter(Boolean).join(', ');
+    const sub = [upcOf(g.key) && 'UPC ' + upcOf(g.key), g.product.brand, g.product.model && 'Model ' + g.product.model, g.product.description].filter(Boolean).join(', ');
     if (sub) { y += 13; doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...muted); doc.text(sub.slice(0, 140), M, y, { maxWidth: W - 2 * M }); }
     const hasLot = g.items.some((i) => i.lot);
     doc.autoTable({ ...base, startY: y + 6,
       head: [hasLot ? ['#', 'Serial number', 'Lot'] : ['#', 'Serial number']],
-      body: g.items.map((it, n) => { const r = [String(n + 1), it.serial || 'No serial']; if (hasLot) r.push(it.lot || ''); return r; }),
+      body: [
+        ...g.items.map((it, n) => { const r = [String(n + 1), it.serial]; if (hasLot) r.push(it.lot || ''); return r; }),
+        ...(g.noSn ? [hasLot ? ['', `No serial number: qty ${g.noSn}`, ''] : ['', `No serial number: qty ${g.noSn}`]] : []),
+      ],
       columnStyles: { 0: { cellWidth: 30, textColor: muted }, 1: { font: 'courier' }, 2: { font: 'courier' } } });
     y = doc.lastAutoTable.finalY + 24;
   }
